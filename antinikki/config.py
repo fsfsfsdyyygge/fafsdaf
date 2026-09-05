@@ -29,5 +29,5 @@ def load_settings() -> Settings:
         database_path=Path(os.getenv("DATABASE_PATH", "data/antinikki.sqlite3")),
         log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
         auto_sync=os.getenv("AUTO_SYNC_COMMANDS", "true").lower() in {"1", "true", "yes", "on"},
-        default_prefix=os.getenv("DEFAULT_PREFIX", "!")[:10] or "!",
+        default_prefix=os.getenv("DEFAULT_PREFIX", ",")[:10] or ",",
     )

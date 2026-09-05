@@ -17,7 +17,10 @@ async def dynamic_prefix(bot: "AntiNikkiBot", message: discord.Message):
         saved = await bot.db.get(message.guild.id)
         if saved:
             prefix = str(saved.get("prefix", prefix))[:10] or prefix
-    return commands.when_mentioned_or(prefix)(bot, message)
+    prefixes = [prefix]
+    if "-" not in prefixes:
+        prefixes.append("-")
+    return commands.when_mentioned_or(*prefixes)(bot, message)
 
 
 class AntiNikkiBot(commands.Bot):
@@ -41,7 +44,7 @@ class AntiNikkiBot(commands.Bot):
 
     async def on_ready(self) -> None:
         self.log.info("ANTINIKKI online as %s (%s)", self.user, self.user.id if self.user else "unknown")
-        await self.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="for server nukes"))
+        await self.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="Server"))
 
     async def on_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
         self.log.exception("Slash command failed", exc_info=error)
